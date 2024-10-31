@@ -80,8 +80,6 @@ const exportFromNotion = async (
       if (!task) throw new Error(`Task [${taskId}] not found.`);
       if (task.error) throw new Error(`Export failed with reason: ${task.error}`);
 
-      console.log(`Exported ${NotionTask.status.pagesExported} pages.`);
-
       if (task.state === "success") {
         exportURL = task.status.exportURL;
         fileTokenCookie = getTasksRequestCookies.find((cookie) =>
