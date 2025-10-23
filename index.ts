@@ -63,10 +63,19 @@ const exportFromNotion = async (
 
   let exportURL: string;
   let fileTokenCookie: string | undefined;
-  let retries = 0;
+  
+  // 轮询配置
+  const POLL_INTERVAL = 3; // 每次轮询间隔 3 秒
+  const MAX_POLL_ATTEMPTS = 100; // 最多轮询 100 次（5 分钟）
+  let pollAttempts = 0;
+  let rateLimitRetries = 0; // 用于 429 错误的指数退避
 
-  while (true) {
-    await sleep(2 ** retries); // Exponential backoff
+  while (pollAttempts < MAX_POLL_ATTEMPTS) {
+    pollAttempts++;
+    
+    // 第一次也要等待，给 Notion 时间准备任务
+    await sleep(POLL_INTERVAL + 2 ** rateLimitRetries);
+    
     try {
       const {
         data: { results: tasks },
@@ -75,35 +84,64 @@ const exportFromNotion = async (
         data: { results: NotionTask[] };
         headers: { [key: string]: string[] };
       } = await client.post("getTasks", { taskIds: [taskId] });
+      
       const task = tasks.find((t) => t.id === taskId);
 
-      if (!task) throw new Error(`Task [${taskId}] not found.`);
-      if (task.error) throw new Error(`Export failed with reason: ${task.error}`);
+      if (!task) {
+        console.log(`[Attempt ${pollAttempts}/${MAX_POLL_ATTEMPTS}] Task not found, retrying...`);
+        continue;
+      }
+
+      console.log(`[Attempt ${pollAttempts}/${MAX_POLL_ATTEMPTS}] Task state: ${task.state}`);
+      
+      // 如果任务有页面导出信息，显示进度
+      if (task.status && task.status.pagesExported) {
+        console.log(`  Progress: ${task.status.pagesExported} pages exported`);
+      }
+      
+      if (task.error) {
+        throw new Error(`Export failed with reason: ${task.error}`);
+      }
 
       if (task.state === "success") {
+        // 检查 status 和 exportURL
+        if (!task.status || !task.status.exportURL) {
+          console.error("Task object:", JSON.stringify(task, null, 2));
+          throw new Error("Task succeeded but exportURL is missing. See task object above.");
+        }
+        
         exportURL = task.status.exportURL;
         fileTokenCookie = getTasksRequestCookies.find((cookie) =>
           cookie.includes("file_token=")
         );
+        
         if (!fileTokenCookie) {
           throw new Error("Task finished but file_token cookie not found.");
         }
-        console.log(`Export finished.`);
+        
+        console.log(`✅ Export finished! Total pages: ${task.status.pagesExported || 'unknown'}`);
         break;
       }
 
-      // Reset retries on success
-      retries = 0;
+      // 重置频率限制计数器（成功获取响应）
+      rateLimitRetries = 0;
+      
     } catch (error) {
       if (axios.isAxiosError(error) && error.response?.status === 429) {
-        console.log("Received response with HTTP 429 (Too Many Requests), retrying after backoff.");
-        retries += 1;
+        console.log(`⚠️  Rate limited (429), applying exponential backoff (${2 ** rateLimitRetries}s)...`);
+        rateLimitRetries += 1;
+        pollAttempts--; // 429 错误不计入轮询次数
         continue;
       }
 
-      // Rethrow if it's not a 429 error
+      // 其他错误直接抛出
       throw error;
     }
+  }
+
+  // 检查是否超时
+  if (pollAttempts >= MAX_POLL_ATTEMPTS) {
+    throw new Error(`Export task timed out after ${MAX_POLL_ATTEMPTS} attempts (${MAX_POLL_ATTEMPTS * POLL_INTERVAL / 60} minutes).`);
   }
 
   const response = await client({
