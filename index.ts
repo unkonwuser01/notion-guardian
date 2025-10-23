@@ -65,8 +65,8 @@ const exportFromNotion = async (
   let fileTokenCookie: string | undefined;
   
   // 轮询配置
-  const POLL_INTERVAL = 3; // 每次轮询间隔 3 秒
-  const MAX_POLL_ATTEMPTS = 100; // 最多轮询 100 次（5 分钟）
+  const POLL_INTERVAL = 5; // 每次轮询间隔 5 秒
+  const MAX_POLL_ATTEMPTS = 360; // 最多轮询 360 次（30 分钟）
   let pollAttempts = 0;
   let rateLimitRetries = 0; // 用于 429 错误的指数退避
 
@@ -104,10 +104,11 @@ const exportFromNotion = async (
       }
 
       if (task.state === "success") {
-        // 检查 status 和 exportURL
+        // 即使任务状态是 success，也要确保 exportURL 已经生成
+        // 有时候任务状态变为 success 但 status 对象还没准备好
         if (!task.status || !task.status.exportURL) {
-          console.error("Task object:", JSON.stringify(task, null, 2));
-          throw new Error("Task succeeded but exportURL is missing. See task object above.");
+          console.log(`  Task is success but exportURL not ready yet, continuing to poll...`);
+          continue; // 继续轮询，不退出
         }
         
         exportURL = task.status.exportURL;
@@ -141,7 +142,7 @@ const exportFromNotion = async (
 
   // 检查是否超时
   if (pollAttempts >= MAX_POLL_ATTEMPTS) {
-    throw new Error(`Export task timed out after ${MAX_POLL_ATTEMPTS} attempts (${MAX_POLL_ATTEMPTS * POLL_INTERVAL / 60} minutes).`);
+    throw new Error(`Export task timed out after ${MAX_POLL_ATTEMPTS} attempts (${Math.round(MAX_POLL_ATTEMPTS * POLL_INTERVAL / 60)} minutes).`);
   }
 
   const response = await client({
