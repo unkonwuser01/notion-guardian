@@ -1,183 +1,160 @@
-import "dotenv/config";
-import axios from "axios";
-import AdmZip from "adm-zip";
-import { createWriteStream, promises as fs } from "fs";
-import { join } from "path";
+import { Client } from '@notionhq/client';
+import axios from 'axios';
+import * as fs from 'fs';
+import * as path from 'path';
+import AdmZip from 'adm-zip';
 
-type NotionTask = {
-  id: string;
-  state: string;
-  status: {
-    pagesExported: number;
-    exportURL: string;
-  };
-  error?: string;
-};
+// --- 配置常量 ---
+const WORKSPACE_DIR = path.join(__dirname, 'workspace'); // 备份文件将解压到这个目录
+const DOWNLOAD_PATH = path.join(__dirname, 'notion-backup.zip'); // 临时下载路径
+const RETRY_DELAY = 5000; // 轮询间隔 (5秒)
+const MAX_RETRIES = 60; // 最大轮询次数 (5秒 * 60 = 5分钟超时)
 
-const { NOTION_TOKEN, NOTION_SPACE_ID, NOTION_USER_ID } = process.env;
-if (!NOTION_TOKEN || !NOTION_SPACE_ID || !NOTION_USER_ID) {
-  throw new Error(
-    "Environment variable NOTION_TOKEN, NOTION_SPACE_ID or NOTION_USER_ID is missing. Check the README.md for more information."
-  );
+/**
+ * 延迟函数
+ * @param ms 延迟的毫秒数
+ */
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-const client = axios.create({
-  baseURL: "https://www.notion.so/api/v3", // Unofficial Notion API
-  headers: {
-    Cookie: `token_v2=${NOTION_TOKEN};`,
-    "x-notion-active-user-header": NOTION_USER_ID,
-  },
-});
+/**
+ * 主执行函数
+ */
+async function run() {
+  console.log('--- Notion Backup Script Started ---');
 
-const sleep = async (seconds: number): Promise<void> => {
-  return new Promise((resolve) => {
-    setTimeout(resolve, seconds * 1000);
-  });
-};
+  // 从环境变量中获取机密信息
+  const notionToken = process.env.NOTION_TOKEN;
+  const spaceId = process.env.NOTION_SPACE_ID;
 
-const round = (number: number) => Math.round(number * 100) / 100;
+  if (!notionToken || !spaceId) {
+    throw new Error('Missing environment variables: NOTION_TOKEN or NOTION_SPACE_ID');
+  }
 
-const exportFromNotion = async (
-  destination: string,
-  format: string
-): Promise<void> => {
-  const task = {
-    eventName: "exportSpace",
-    request: {
-      spaceId: NOTION_SPACE_ID,
-      shouldExportComments: false,
-      exportOptions: {
-        exportType: format,
-        collectionViewExportType: "currentView",
-        timeZone: "Europe/Berlin",
-        locale: "en",
-        preferredViewMap: {},
+  try {
+    // 1. 启动导出任务并获取导出 URL
+    const exportUrl = await getNotionExportUrl(notionToken, spaceId);
+
+    // 2. 下载备份文件
+    await downloadFile(exportUrl, DOWNLOAD_PATH);
+
+    // 3. 解压备份文件
+    unzipBackup(DOWNLOAD_PATH, WORKSPACE_DIR);
+
+    // 4. 清理临时下载的 zip 文件
+    fs.unlinkSync(DOWNLOAD_PATH);
+
+    console.log('✅ Notion workspace backup completed successfully!');
+  } catch (error) {
+    console.error('❌ Backup process failed:', error);
+    process.exit(1); // 以错误码退出，使 GitHub Actions 任务失败
+  }
+}
+
+/**
+ * 启动 Notion 导出任务并轮询以获取下载 URL
+ * @param token Notion API Token
+ * @param spaceId Notion Space ID
+ */
+async function getNotionExportUrl(token: string, spaceId: string): Promise<string> {
+  const notion = new Client({ auth: token });
+
+  console.log('Step 1: Enqueueing Notion workspace export task...');
+  const
+  const taskResponse = await notion.enqueueTask({
+    task: {
+      eventName: 'exportWorkspace',
+      request: {
+        spaceId: spaceId,
+        exportOptions: {
+          exportType: 'markdown',
+          timeZone: 'Asia/Shanghai',
+          locale: 'en',
+        },
       },
     },
-  };
-  const {
-    data: { taskId },
-  }: { data: { taskId: string } } = await client.post("enqueueTask", { task });
+  });
 
-  console.log(`Started export as task [${taskId}].`);
+  const taskId = taskResponse.taskId;
+  console.log(`Task enqueued with ID: ${taskId}`);
 
-  let exportURL: string;
-  let fileTokenCookie: string | undefined;
-  let retries = 0;
+  // 轮询任务状态
+  for (let i = 0; i < MAX_RETRIES; i++) {
+    await delay(RETRY_DELAY);
+    console.log(`Polling task status... Attempt ${i + 1}/${MAX_RETRIES}`);
 
-  while (true) {
-    await sleep(2 ** retries); // Exponential backoff
-    try {
-      const {
-        data: { results: tasks },
-        headers: { "set-cookie": getTasksRequestCookies },
-      }: {
-        data: { results: NotionTask[] };
-        headers: { [key: string]: string[] };
-      } = await client.post("getTasks", { taskIds: [taskId] });
-      const task = tasks.find((t) => t.id === taskId);
+    const statusResponse = await notion.getTasks({ taskId });
+    const task = statusResponse.results?.[0]; // 假设 getTasks 返回一个包含 results 的对象
 
-      if (!task) throw new Error(`Task [${taskId}] not found.`);
-      if (task.error) throw new Error(`Export failed with reason: ${task.error}`);
+    if (!task) {
+      console.warn(`Could not retrieve status for task ID: ${taskId}. Retrying...`);
+      continue;
+    }
 
-      if (task.state === "success") {
-        exportURL = task.status.exportURL;
-        fileTokenCookie = getTasksRequestCookies.find((cookie) =>
-          cookie.includes("file_token=")
-        );
-        if (!fileTokenCookie) {
-          throw new Error("Task finished but file_token cookie not found.");
+    switch (task.state) {
+      case 'success':
+        console.log('Export task succeeded! Export URL received.');
+        // 注意：这里的路径可能需要根据 Notion API 的实际返回结构进行微调
+        if (task.status?.exportURL) {
+            return task.status.exportURL;
+        } else {
+            throw new Error('Task successful, but exportURL is missing from the response.');
         }
-        console.log(`Export finished.`);
+
+      case 'failure':
+        throw new Error(`Notion export task failed: ${task.status?.error || 'Unknown error'}`);
+      
+      case 'in_progress':
+      default:
+        console.log(`Task state: ${task.state}. Waiting...`);
         break;
-      }
-
-      // Reset retries on success
-      retries = 0;
-    } catch (error) {
-      if (axios.isAxiosError(error) && error.response?.status === 429) {
-        console.log("Received response with HTTP 429 (Too Many Requests), retrying after backoff.");
-        retries += 1;
-        continue;
-      }
-
-      // Rethrow if it's not a 429 error
-      throw error;
     }
   }
 
-  const response = await client({
-    method: "GET",
-    url: exportURL,
-    responseType: "stream",
-    headers: { Cookie: fileTokenCookie },
+  throw new Error('Notion export task timed out after multiple retries.');
+}
+
+/**
+ * 从给定的 URL 下载文件
+ * @param url 文件 URL
+ * @param outputPath 本地保存路径
+ */
+async function downloadFile(url: string, outputPath: string) {
+  console.log(`Step 2: Downloading backup file from URL...`);
+  const writer = fs.createWriteStream(outputPath);
+  
+  const response = await axios({
+    url,
+    method: 'GET',
+    responseType: 'stream',
   });
 
-  const size = response.headers["content-length"];
-  console.log(`Downloading ${round(size / 1000 / 1000)}mb...`);
+  response.data.pipe(writer);
 
-  const stream = response.data.pipe(createWriteStream(destination));
-  await new Promise((resolve, reject) => {
-    stream.on("close", resolve);
-    stream.on("error", reject);
+  return new Promise((resolve, reject) => {
+    writer.on('finish', resolve);
+    writer.on('error', reject);
   });
-};
+}
 
-const extractZip = async (
-  filename: string,
-  destination: string
-): Promise<void> => {
-  const zip = new AdmZip(filename);
-  zip.extractAllTo(destination, true);
+/**
+ * 解压备份文件并清理
+ * @param zipPath zip 文件路径
+ * @param outputDir 解压目标目录
+ */
+function unzipBackup(zipPath: string, outputDir: string) {
+  console.log(`Step 3: Unzipping backup file to ${outputDir}...`);
 
-  const extractedFiles = zip.getEntries().map((entry) => entry.entryName);
-  const partFiles = extractedFiles.filter((name) =>
-    name.match(/Part-\d+\.zip/)
-  );
+  // 如果 workspace 目录已存在，先清空它，避免旧文件残留
+  if (fs.existsSync(outputDir)) {
+    fs.rmSync(outputDir, { recursive: true, force: true });
+  }
+  fs.mkdirSync(outputDir, { recursive: true });
 
-  // Extract found "Part-*.zip" files to destination and delete them:
-  await Promise.all(
-    partFiles.map(async (partFile: string) => {
-      partFile = join(destination, partFile);
-      const partZip = new AdmZip(partFile);
-      partZip.extractAllTo(destination, true);
-      await fs.unlink(partFile);
-    })
-  );
+  const zip = new AdmZip(zipPath);
+  zip.extractAllTo(outputDir, true); // true 表示覆盖现有文件
+}
 
-  const extractedFolders = await fs.readdir(destination);
-  const exportFolders = extractedFolders.filter((name: string) =>
-    name.startsWith("Export-")
-  );
-
-  // Move the contents of found "Export-*" folders to destination and delete them:
-  await Promise.all(
-    exportFolders.map(async (folderName: string) => {
-      const folderPath = join(destination, folderName);
-      const contents = await fs.readdir(folderPath);
-      await Promise.all(
-        contents.map(async (file: string) => {
-          const filePath = join(folderPath, file);
-          const newFilePath = join(destination, file);
-          await fs.rename(filePath, newFilePath);
-        })
-      );
-      await fs.rmdir(folderPath);
-    })
-  );
-};
-
-const run = async (): Promise<void> => {
-  const workspaceDir = join(process.cwd(), "workspace");
-  const workspaceZip = join(process.cwd(), "workspace.zip");
-
-  await exportFromNotion(workspaceZip, "markdown");
-  await fs.rm(workspaceDir, { recursive: true, force: true });
-  await fs.mkdir(workspaceDir, { recursive: true });
-  await extractZip(workspaceZip, workspaceDir);
-  await fs.unlink(workspaceZip);
-
-  console.log("✅ Export downloaded and unzipped.");
-};
-
+// 运行脚本
 run();
