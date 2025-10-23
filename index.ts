@@ -67,8 +67,8 @@ const exportFromNotion = async (
   let fileTokenCookie: string | undefined;
   
   // 轮询配置
-  const POLL_INTERVAL = 5; // 每次轮询间隔 5 秒
-  const MAX_POLL_ATTEMPTS = 360; // 最多轮询 360 次（30 分钟）
+  const POLL_INTERVAL = 10; // 每次轮询间隔 10 秒
+  const MAX_POLL_ATTEMPTS = 180; // 最多轮询 180 次（30 分钟）
   let pollAttempts = 0;
   let rateLimitRetries = 0; // 用于 429 错误的指数退避
 
@@ -94,16 +94,29 @@ const exportFromNotion = async (
         continue;
       }
 
-      console.log(`[Attempt ${pollAttempts}/${MAX_POLL_ATTEMPTS}] Task state: ${task.state}`);
+      // 每 6 次轮询（约 1 分钟）打印一次详细信息
+      const shouldPrintDetails = pollAttempts % 6 === 1 || pollAttempts === 1;
       
-      // 显示导出进度（支持 pagesExported 和 exportedCount 两种字段名）
-      if (task.status) {
-        const exportCount = task.status.pagesExported || task.status.exportedCount;
-        if (exportCount) {
-          console.log(`  Progress: ${exportCount} items exported`);
+      if (shouldPrintDetails) {
+        console.log(`[Attempt ${pollAttempts}/${MAX_POLL_ATTEMPTS}] Task state: ${task.state}`);
+        
+        // 显示导出进度（支持 pagesExported 和 exportedCount 两种字段名）
+        if (task.status) {
+          const exportCount = task.status.pagesExported || task.status.exportedCount;
+          if (exportCount) {
+            console.log(`  Progress: ${exportCount} items exported`);
+          }
+          if (task.status.type) {
+            console.log(`  Status type: ${task.status.type}`);
+          }
         }
-        if (task.status.type) {
-          console.log(`  Status type: ${task.status.type}`);
+      } else {
+        // 简化输出：只显示进度点
+        const exportCount = task.status?.pagesExported || task.status?.exportedCount;
+        if (exportCount) {
+          process.stdout.write(`  [${pollAttempts}] ${exportCount} items ... `);
+        } else {
+          process.stdout.write('.');
         }
       }
       
@@ -115,7 +128,9 @@ const exportFromNotion = async (
         // 即使任务状态是 success，也要确保 exportURL 已经生成
         // 有时候任务状态变为 success 但 status 对象还没准备好
         if (!task.status || !task.status.exportURL) {
-          console.log(`  Task is success but exportURL not ready yet, continuing to poll...`);
+          if (shouldPrintDetails) {
+            console.log(`  Task is success but exportURL not ready yet, continuing to poll...`);
+          }
           continue; // 继续轮询，不退出
         }
         
@@ -126,6 +141,11 @@ const exportFromNotion = async (
         
         if (!fileTokenCookie) {
           throw new Error("Task finished but file_token cookie not found.");
+        }
+        
+        // 如果之前有简化输出，先换行
+        if (!shouldPrintDetails) {
+          console.log('');
         }
         
         const totalCount = task.status.pagesExported || task.status.exportedCount || 'unknown';
