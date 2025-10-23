@@ -7,9 +7,11 @@ import { join } from "path";
 type NotionTask = {
   id: string;
   state: string;
-  status: {
-    pagesExported: number;
-    exportURL: string;
+  status?: {
+    type?: string;
+    pagesExported?: number;
+    exportedCount?: number;
+    exportURL?: string;
   };
   error?: string;
 };
@@ -94,9 +96,15 @@ const exportFromNotion = async (
 
       console.log(`[Attempt ${pollAttempts}/${MAX_POLL_ATTEMPTS}] Task state: ${task.state}`);
       
-      // 如果任务有页面导出信息，显示进度
-      if (task.status && task.status.pagesExported) {
-        console.log(`  Progress: ${task.status.pagesExported} pages exported`);
+      // 显示导出进度（支持 pagesExported 和 exportedCount 两种字段名）
+      if (task.status) {
+        const exportCount = task.status.pagesExported || task.status.exportedCount;
+        if (exportCount) {
+          console.log(`  Progress: ${exportCount} items exported`);
+        }
+        if (task.status.type) {
+          console.log(`  Status type: ${task.status.type}`);
+        }
       }
       
       if (task.error) {
@@ -120,7 +128,8 @@ const exportFromNotion = async (
           throw new Error("Task finished but file_token cookie not found.");
         }
         
-        console.log(`✅ Export finished! Total pages: ${task.status.pagesExported || 'unknown'}`);
+        const totalCount = task.status.pagesExported || task.status.exportedCount || 'unknown';
+        console.log(`✅ Export finished! Total items: ${totalCount}`);
         break;
       }
 
